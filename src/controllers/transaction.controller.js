@@ -64,7 +64,7 @@ async function createTransactionController(req, res) {
       } else {
         return res
           .status(200)
-          .json({ message: "Transaction is still being processed" });
+          .json({ message: "transaction is in pending, try again after sometime" });
       }
     }
     if (existing.status === "FAILED" || existing.status === "REVERSED")
@@ -101,56 +101,55 @@ async function createTransactionController(req, res) {
         message: `Insufficient balance. Current balance is ${balance}. Requested amount is ${amount}`,
       });
 
-  // 5-9. Create transaction and ledger entries inside a transaction
+  // 5. Create transaction OUTSIDE the session to make PENDING state visible immediately
+  let transaction;
+  try {
+    transaction = new transactionModel({
+      fromAccount,
+      toAccount,
+      amount: Number(amount),
+      idempotencyKey,
+      status: "PENDING",
+    });
+    await transaction.save();
+  } catch (err) {
+    if (err.code === 11000) {
+      const existingAfter = await transactionModel.findOne({
+        idempotencyKey,
+      });
+      if (existingAfter) {
+        if (existingAfter.status === "COMPLETED") {
+          return res
+            .status(200)
+            .json({
+              message: "Transaction already processed",
+              transaction: existingAfter,
+            });
+        }
+        if (existingAfter.status === "PENDING") {
+          return res
+            .status(200)
+            .json({ message: "transaction is in pending, try again after sometime" });
+        }
+        return res
+          .status(500)
+          .json({
+            message: "Transaction processing failed, please try again",
+          });
+      }
+      console.error("Failed to create transaction - existing null", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to create transaction" });
+    }
+    console.error("Failed to create transaction document", err);
+    return res.status(500).json({ message: "Failed to create transaction" });
+  }
+
+  // 6-9. Create ledger entries inside a transaction
   const session = await mongoose.startSession();
   try {
     session.startTransaction();
-
-    let transaction;
-    try {
-      transaction = new transactionModel({
-        fromAccount,
-        toAccount,
-        amount: Number(amount),
-        idempotencyKey,
-        status: "PENDING",
-      });
-      await transaction.save({ session });
-    } catch (err) {
-      if (err.code === 11000) {
-        const existingAfter = await transactionModel.findOne({
-          idempotencyKey,
-        });
-        await session.abortTransaction();
-        session.endSession();
-        if (existingAfter) {
-          if (existingAfter.status === "COMPLETED") {
-            return res
-              .status(200)
-              .json({
-                message: "Transaction already processed",
-                transaction: existingAfter,
-              });
-          }
-          if (existingAfter.status === "PENDING") {
-            return res
-              .status(200)
-              .json({ message: "Transaction is still being processed" });
-          }
-          return res
-            .status(500)
-            .json({
-              message: "Transaction processing failed, please try again",
-            });
-        }
-        console.error("Failed to create transaction - existing null", err);
-        return res
-          .status(500)
-          .json({ message: "Failed to create transaction" });
-      }
-      console.error("Failed to create transaction document", err);
-      throw err;
-    }
 
     await ledgerModel.create(
       [{
@@ -161,6 +160,10 @@ async function createTransactionController(req, res) {
       }],
       { session },
     );
+
+    // DELAY 15 seconds after amount is debited to get credited
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
     await ledgerModel.create(
       [{
         account: toUserAccount._id,
@@ -172,7 +175,11 @@ async function createTransactionController(req, res) {
     );
 
     transaction.status = "COMPLETED";
-    await transaction.save({ session });
+    await transactionModel.updateOne(
+      { _id: transaction._id },
+      { $set: { status: "COMPLETED" } },
+      { session }
+    );
 
     await session.commitTransaction();
     session.endSession();
@@ -184,8 +191,10 @@ async function createTransactionController(req, res) {
         amount,
         toUserAccount._id,
       );
-    } catch (e) {
-      console.error("email failed", e);
+    } catch (error) {
+      res.status(400).json({
+        message: "Transaction is Pending due to some issue , please retry after sometime."
+      })
     }
 
     return res
@@ -195,6 +204,10 @@ async function createTransactionController(req, res) {
     await session.abortTransaction();
     session.endSession();
     console.error(err);
+    await transactionModel.updateOne(
+      { _id: transaction._id },
+      { $set: { status: "FAILED" } }
+    );
     return res.status(500).json({ message: "Failed to process transaction" });
   }
 }
@@ -246,58 +259,55 @@ async function createIntialFundsTransactionController(req, res) {
       } else {
         return res
           .status(200)
-          .json({ message: "Transaction is still being processed" });
+          .json({ message: "transaction is in pending, try again after sometime" });
       }
     }
+  }
+
+  let transaction;
+  try {
+    transaction = new transactionModel({
+      fromAccount: fromUserAccount._id,
+      toAccount: toUserAccount._id,
+      amount,
+      idempotencyKey,
+      status: "PENDING"
+    });
+    await transaction.save();
+  }
+  catch (err) {
+    if (err.code === 11000) {
+      const existingAfter = await transactionModel.findOne({
+        idempotencyKey,
+      });
+      if (existingAfter) {
+        if (existingAfter.status === "COMPLETED")
+          return res
+            .status(200)
+            .json({
+              message: "Transaction already processed",
+              transaction: existingAfter,
+            });
+        if (existingAfter.status === "PENDING")
+          return res
+            .status(200)
+            .json({ message: "transaction is in pending, try again after sometime" });
+        return res
+          .status(500)
+          .json({
+            message: "Transaction processing failed, please try again",
+          });
+      }
+      return res
+        .status(500)
+        .json({ message: "Failed to create transaction" });
+    }
+    throw err;
   }
 
   const session = await mongoose.startSession();
   try {
     session.startTransaction();
-
-    let transaction;
-    try {
-      // use document + save to ensure session is honored and validation works predictably
-      transaction = new transactionModel({
-        fromAccount: fromUserAccount._id,
-        toAccount: toUserAccount._id,
-        amount,
-        idempotencyKey,
-        status: "PENDING"
-      });
-      await transaction.save({ session });
-    }
-    catch (err) {
-      if (err.code === 11000) {
-        const existingAfter = await transactionModel.findOne({
-          idempotencyKey,
-        });
-        await session.abortTransaction();
-        session.endSession();
-        if (existingAfter) {
-          if (existingAfter.status === "COMPLETED")
-            return res
-              .status(200)
-              .json({
-                message: "Transaction already processed",
-                transaction: existingAfter,
-              });
-          if (existingAfter.status === "PENDING")
-            return res
-              .status(200)
-              .json({ message: "Transaction is still being processed" });
-          return res
-            .status(500)
-            .json({
-              message: "Transaction processing failed, please try again",
-            });
-        }
-        return res
-          .status(500)
-          .json({ message: "Failed to create transaction" });
-      }
-      throw err;
-    }
 
     await ledgerModel.create(
       [{
@@ -308,6 +318,10 @@ async function createIntialFundsTransactionController(req, res) {
       }],
       { session },
     );
+
+    // DELAY 15 seconds after amount is debited to get credited
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
     await ledgerModel.create(
       [{
         account: toUserAccount._id,
@@ -319,7 +333,11 @@ async function createIntialFundsTransactionController(req, res) {
     );
 
     transaction.status = "COMPLETED";
-    await transaction.save({ session });
+    await transactionModel.updateOne(
+      { _id: transaction._id },
+      { $set: { status: "COMPLETED" } },
+      { session }
+    );
 
     await session.commitTransaction();
     session.endSession();
@@ -334,6 +352,10 @@ async function createIntialFundsTransactionController(req, res) {
     await session.abortTransaction();
     session.endSession();
     console.error(err);
+    await transactionModel.updateOne(
+      { _id: transaction._id },
+      { $set: { status: "FAILED" } }
+    );
     return res
       .status(500)
       .json({
